@@ -1,27 +1,23 @@
-# ETF Daily Parser PRO
+# Russian Daily Parser MFD / MOEX
 
-Сайт для автоматической загрузки дневных данных по ETF/тикерам и расчета Daily Return.
+Сайт для загрузки дневной доходности российских активов по тикерам и диапазону дат.
 
 ## Возможности
-
 - ввод тикеров через запятую;
 - выбор диапазона дат;
-- загрузка данных через `/api/history`;
-- Yahoo Finance как основной источник;
-- Stooq как резервный источник;
-- `MNYMKT` как денежный рынок с Daily Return = 0%;
+- источник: Auto `MFD → MOEX`, только `MFD`, только `MOEX`;
 - таблица Daily Return по каждому дню;
-- контрольная таблица цен;
-- сводная аналитика: Total Return, CAGR, annualized volatility, max drawdown, positive days, best/worst day;
-- CSV для скачивания содержит только Daily Return, без цен.
+- CSV выгружается только с Daily Return;
+- `CASH`, `RUB`, `MNYMKT` = кэш с доходностью 0%.
 
 ## Запуск
-
 ```bash
 npm install
 npm run dev
 ```
 
 ## Деплой на Vercel
+Проект готов к деплою. Серверная функция лежит в `/api/market-data.js`, поэтому CORS браузера не мешает парсингу.
 
-Загрузите проект в GitHub и подключите репозиторий к Vercel. API находится в папке `/api/history.js`.
+## Важно по MFD
+MFD имеет экспорт исторических данных в CSV/MetaStock. В проекте реализована попытка загрузки через MFD export и fallback на MOEX ISS API. Для некоторых тикеров MFD использует внутренние названия, поэтому для надежности оставлен источник MOEX.
