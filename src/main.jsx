@@ -1,103 +1,12 @@
-import React, { useMemo, useRef, useState } from 'react';
-import { createRoot } from 'react-dom/client';
-import './style.css';
-
-const DEFAULT_TICKERS = 'SBER, LKOH, GAZP, TATN, GMKN, VTBR, RUAL, AFLT, NVTK, MOEX, YDEX, CASH';
-
-function parseTickers(text) {
-  return [...new Set(text.split(/[ ,;\n\t]+/).map(x => x.trim().toUpperCase()).filter(Boolean))];
-}
-function pct(x) { return x == null || !Number.isFinite(x) ? '' : (x * 100).toFixed(2) + '%'; }
-function csvEscape(v) { const s = String(v ?? ''); return /[",\n;]/.test(s) ? '"' + s.replaceAll('"','""') + '"' : s; }
-
-function App() {
-  const today = new Date().toISOString().slice(0,10);
-  const [tickersText, setTickersText] = useState(DEFAULT_TICKERS);
-  const [from, setFrom] = useState('2024-01-01');
-  const [till, setTill] = useState(today);
-  const [loading, setLoading] = useState(false);
-  const [logs, setLogs] = useState([]);
-  const [series, setSeries] = useState({});
-  const abortRef = useRef(null);
-
-  const tickers = useMemo(() => parseTickers(tickersText), [tickersText]);
-
-  async function loadTicker(ticker, signal) {
-    if (['CASH','RUB','MNYMKT'].includes(ticker)) return { ticker, rows: [], board: 'CASH' };
-    const url = `/api/moex-history?ticker=${encodeURIComponent(ticker)}&from=${from}&till=${till}`;
-    const r = await fetch(url, { signal });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
-    return j;
-  }
-
-  async function loadAll() {
-    setLoading(true); setLogs([]); setSeries({});
-    const controller = new AbortController(); abortRef.current = controller;
-    const nextSeries = {};
-    for (const ticker of tickers) {
-      if (controller.signal.aborted) break;
-      setLogs(prev => [...prev, `⏳ ${ticker}: загрузка...`]);
-      try {
-        const result = await loadTicker(ticker, controller.signal);
-        nextSeries[ticker] = result.rows || [];
-        setSeries({ ...nextSeries });
-        const count = result.rows?.length || 0;
-        setLogs(prev => [...prev.filter(x => x !== `⏳ ${ticker}: загрузка...`), `✅ ${ticker}: ${count ? count + ' дней, board ' + result.board : 'кэш 0%'}`]);
-      } catch (e) {
-        setLogs(prev => [...prev.filter(x => x !== `⏳ ${ticker}: загрузка...`), `❌ ${ticker}: ${e.message}`]);
-      }
-    }
-    setLoading(false);
-  }
-  function stop() { abortRef.current?.abort(); setLoading(false); setLogs(prev => [...prev, '⛔ загрузка остановлена']); }
-
-  const returnsTable = useMemo(() => {
-    const dates = new Set();
-    const returnsByTicker = {};
-    for (const ticker of tickers) {
-      const rows = series[ticker] || [];
-      returnsByTicker[ticker] = {};
-      if (['CASH','RUB','MNYMKT'].includes(ticker)) continue;
-      for (let i = 1; i < rows.length; i++) {
-        const ret = rows[i-1].close ? rows[i].close / rows[i-1].close - 1 : null;
-        returnsByTicker[ticker][rows[i].date] = ret;
-        dates.add(rows[i].date);
-      }
-    }
-    const sorted = [...dates].sort();
-    return sorted.map(date => {
-      const row = { Date: date };
-      for (const ticker of tickers) {
-        row[ticker] = ['CASH','RUB','MNYMKT'].includes(ticker) ? 0 : (returnsByTicker[ticker]?.[date] ?? null);
-      }
-      return row;
-    });
-  }, [series, tickers]);
-
-  function downloadReturns() {
-    if (!returnsTable.length) return;
-    const header = ['Date', ...tickers];
-    const lines = [header.join(';')];
-    for (const row of returnsTable) lines.push(header.map(h => h === 'Date' ? row.Date : pct(row[h])).map(csvEscape).join(';'));
-    const blob = new Blob(['\ufeff' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = `daily_returns_moex_${from}_${till}.csv`; a.click();
-  }
-
-  return <div className="page">
-    <header><div><h1>Парсер российских активов</h1><p>Источник: серверный API MOEX ISS без CORS-зависаний. Экспорт — только Daily Return.</p></div></header>
-    <section className="card controls">
-      <label>Тикеры<textarea value={tickersText} onChange={e=>setTickersText(e.target.value)} /></label>
-      <div className="dates"><label>С даты<input type="date" value={from} onChange={e=>setFrom(e.target.value)} /></label><label>По дату<input type="date" value={till} onChange={e=>setTill(e.target.value)} /></label></div>
-      <div className="buttons"><button disabled={loading} onClick={loadAll}>{loading ? 'Загрузка...' : 'Загрузить Daily Return'}</button><button onClick={stop} disabled={!loading} className="secondary">Остановить</button><button onClick={downloadReturns} disabled={!returnsTable.length} className="secondary">Скачать CSV Daily Return</button></div>
-    </section>
-    <section className="grid">
-      <div className="card"><h2>Статус</h2><div className="log">{logs.map((l,i)=><div key={i}>{l}</div>)}</div></div>
-      <div className="card"><h2>Итог</h2><p>Тикеров: <b>{tickers.length}</b></p><p>Строк Daily Return: <b>{returnsTable.length}</b></p><p>Загружено активов: <b>{Object.keys(series).length}</b></p></div>
-    </section>
-    <section className="card"><h2>Daily Return</h2><div className="tableWrap"><table><thead><tr><th>Date</th>{tickers.map(t=><th key={t}>{t}</th>)}</tr></thead><tbody>{returnsTable.slice(-300).map(r=><tr key={r.Date}><td>{r.Date}</td>{tickers.map(t=><td key={t}>{pct(r[t])}</td>)}</tr>)}</tbody></table></div></section>
-  </div>;
-}
-
-createRoot(document.getElementById('root')).render(<App />);
+import React,{useState,useMemo,useRef}from'react';import{createRoot}from'react-dom/client';import{Download,Play,Square,RefreshCcw}from'lucide-react';import'./style.css';
+const DEFAULT='SBER, LKOH, GAZP, TATN, GMKN, VTBR, RUAL, AFLT, NVTK, MOEX, YDEX, CASH';
+function fmtPct(x){return x==null?'':(x*100).toFixed(2)+'%'}
+function toCsv(rows,tickers){const h=['Date',...tickers];const lines=[h.join(',')];for(const r of rows){lines.push([r.date,...tickers.map(t=>r.returns[t]==null?'':(r.returns[t]*100).toFixed(6)+'%')].join(','))}return lines.join('\n')}
+function download(name,text){const b=new Blob(['\ufeff'+text],{type:'text/csv;charset=utf-8;'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download=name;a.click();URL.revokeObjectURL(u)}
+async function fetchTicker(ticker,from,till,signal){const r=await fetch(`/api/moex-history?ticker=${encodeURIComponent(ticker)}&from=${from}&till=${till}`,{signal});return r.json()}
+function App(){const[tickersText,setTickersText]=useState(DEFAULT);const[from,setFrom]=useState('2024-01-01');const[till,setTill]=useState(new Date().toISOString().slice(0,10));const[status,setStatus]=useState([]);const[data,setData]=useState({});const[loading,setLoading]=useState(false);const ctrl=useRef(null);const tickers=useMemo(()=>[...new Set(tickersText.split(/[;,\s]+/).map(x=>x.trim().toUpperCase()).filter(Boolean))], [tickersText]);
+const table=useMemo(()=>{const dates=new Set();for(const t of Object.keys(data))for(const p of data[t])dates.add(p.date);const ds=[...dates].sort();return ds.map(date=>{const prices={},returns={};for(const t of Object.keys(data)){const arr=data[t];const i=arr.findIndex(x=>x.date===date);if(i>=0){prices[t]=arr[i].close;returns[t]=i>0?arr[i].close/arr[i-1].close-1:0}}return{date,prices,returns}})},[data]);
+async function load(){ctrl.current?.abort();const ac=new AbortController();ctrl.current=ac;setLoading(true);setData({});setStatus([]);const next={};for(const t of tickers){if(ac.signal.aborted)break;setStatus(s=>[...s,{ticker:t,msg:'загрузка...',type:'wait'}]);try{if(['CASH','RUB','MNYMKT'].includes(t)){const cashRows=[];let d=new Date(from);const end=new Date(till);while(d<=end){if(d.getDay()!==0&&d.getDay()!==6)cashRows.push({date:d.toISOString().slice(0,10),close:1});d.setDate(d.getDate()+1)}next[t]=cashRows;setStatus(s=>s.map(x=>x.ticker===t?{ticker:t,msg:'кэш 0%',type:'ok'}:x));continue}const j=await fetchTicker(t,from,till,ac.signal);if(j.ok&&j.rows?.length){next[t]=j.rows;setStatus(s=>s.map(x=>x.ticker===t?{ticker:t,msg:`${j.rows.length} дней, ${j.market}/${j.board}${j.requested&&j.requested!==j.ticker?` (${j.requested}→${j.ticker})`:''}`,type:'ok'}:x));}else{setStatus(s=>s.map(x=>x.ticker===t?{ticker:t,msg:j.error||'данные не найдены',type:'bad'}:x));}}catch(e){setStatus(s=>s.map(x=>x.ticker===t?{ticker:t,msg:e.name==='AbortError'?'остановлено':e.message,type:'bad'}:x));}setData({...next});}
+setLoading(false)}
+return <div className="wrap"><header><h1>MOEX Daily Return Parser</h1><p>Автоматическая загрузка дневных данных российских активов через серверный MOEX ISS API. CSV выгружает только Daily Return.</p></header><section className="panel"><label>Тикеры</label><textarea value={tickersText} onChange={e=>setTickersText(e.target.value)}/><div className="grid"><div><label>Дата от</label><input type="date" value={from} onChange={e=>setFrom(e.target.value)}/></div><div><label>Дата до</label><input type="date" value={till} onChange={e=>setTill(e.target.value)}/></div></div><div className="buttons"><button onClick={load} disabled={loading}><Play size={18}/> Загрузить</button><button className="secondary" onClick={()=>ctrl.current?.abort()}><Square size={18}/> Остановить</button><button className="secondary" onClick={()=>{setData({});setStatus([])}}><RefreshCcw size={18}/> Сброс</button><button className="secondary" disabled={!table.length} onClick={()=>download('moex_daily_returns.csv',toCsv(table,Object.keys(data)))}><Download size={18}/> Скачать Daily Return CSV</button></div></section><section className="status"><h2>Статус</h2>{status.length===0?<p className="muted">Пока нет загрузки.</p>:status.map(s=><div className={s.type} key={s.ticker}>{s.type==='ok'?'✅':s.type==='bad'?'❌':'⏳'} <b>{s.ticker}</b>: {s.msg}</div>)}</section><section className="tablebox"><h2>Daily Return</h2>{table.length===0?<p className="muted">После загрузки здесь появятся дневные доходности.</p>:<table><thead><tr><th>Date</th>{Object.keys(data).map(t=><th key={t}>{t}</th>)}</tr></thead><tbody>{table.map(r=><tr key={r.date}><td>{r.date}</td>{Object.keys(data).map(t=><td key={t}>{fmtPct(r.returns[t])}</td>)}</tr>)}</tbody></table>}</section></div>}
+createRoot(document.getElementById('root')).render(<App/>);

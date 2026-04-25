@@ -1,80 +1,82 @@
-const BOARDS = ["TQBR", "TQTF", "TQTD", "TQTE", "TQPI", "TQIF", "TQOB", "TQOD", "TQCB"];
-const ENGINE = "stock";
-const MARKET = "shares";
+const BASE = 'https://iss.moex.com/iss';
+const BOARDS = ['TQBR','TQTF','TQTD','TQIF','TQPI','TQBD','TQOB','TQCB','TQIR'];
+const MARKETS = ['shares','foreignshares','bonds'];
+const CASH = new Set(['CASH','RUB','MNYMKT','MM','MONEY']);
 
-function send(res, status, body) {
-  res.statusCode = status;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Cache-Control", "s-maxage=3600, stale-while-revalidate=86400");
-  res.end(JSON.stringify(body));
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function timeoutSignal(ms){ const c = new AbortController(); setTimeout(()=>c.abort(), ms); return c.signal; }
+function tableToObjects(tbl){
+  if(!tbl || !Array.isArray(tbl.columns) || !Array.isArray(tbl.data)) return [];
+  return tbl.data.map(row => Object.fromEntries(tbl.columns.map((c,i)=>[c,row[i]])));
 }
-
-async function fetchJson(url, timeoutMs = 12000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const r = await fetch(url, {
-      signal: controller.signal,
-      headers: { "User-Agent": "Mozilla/5.0 russian-parser/1.0" }
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return await r.json();
-  } finally {
-    clearTimeout(timer);
-  }
+async function getJson(url, ms=12000){
+  const r = await fetch(url, { headers: {'User-Agent':'Mozilla/5.0'}, signal: timeoutSignal(ms) });
+  if(!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
 }
-
-function blockRows(json, name) {
-  const b = json?.[name];
-  if (!b || !Array.isArray(b.columns) || !Array.isArray(b.data)) return [];
-  return b.data.map(row => Object.fromEntries(b.columns.map((c, i) => [c, row[i]])));
-}
-
-async function loadBoard(secid) {
-  // Сначала пробуем популярные board без лишнего поиска — это быстрее.
-  for (const board of BOARDS) {
-    const url = `https://iss.moex.com/iss/history/engines/${ENGINE}/markets/${MARKET}/boards/${board}/securities/${encodeURIComponent(secid)}.json?iss.meta=off&from=2024-01-01&till=2024-01-15&history.columns=TRADEDATE,CLOSE,WAPRICE,LEGALCLOSEPRICE`;
-    try {
-      const json = await fetchJson(url, 7000);
-      const rows = blockRows(json, "history");
-      if (rows.length) return board;
-    } catch (_) {}
-  }
-  return null;
-}
-
-async function loadHistory(secid, board, from, till) {
+async function fetchHistory(secid, market, board, from, till){
+  let all = [];
   let start = 0;
-  const out = [];
-  for (let page = 0; page < 80; page++) {
-    const url = `https://iss.moex.com/iss/history/engines/${ENGINE}/markets/${MARKET}/boards/${board}/securities/${encodeURIComponent(secid)}.json?iss.meta=off&from=${from}&till=${till}&start=${start}&history.columns=TRADEDATE,CLOSE,WAPRICE,LEGALCLOSEPRICE`;
-    const json = await fetchJson(url, 12000);
-    const rows = blockRows(json, "history");
-    if (!rows.length) break;
-    for (const r of rows) {
-      const price = Number(r.CLOSE ?? r.LEGALCLOSEPRICE ?? r.WAPRICE);
-      if (r.TRADEDATE && Number.isFinite(price) && price > 0) out.push({ date: r.TRADEDATE, close: price });
-    }
-    if (rows.length < 100) break;
-    start += rows.length;
+  while(true){
+    const url = `${BASE}/history/engines/stock/markets/${market}/boards/${board}/securities/${encodeURIComponent(secid)}.json?iss.meta=off&iss.only=history&history.columns=TRADEDATE,SECID,CLOSE,LEGALCLOSEPRICE,WAPRICE,BOARDID&from=${from}&till=${till}&start=${start}`;
+    const json = await getJson(url);
+    const rows = tableToObjects(json.history);
+    const valid = rows.filter(x => x.TRADEDATE && (x.CLOSE ?? x.LEGALCLOSEPRICE ?? x.WAPRICE) != null);
+    all.push(...valid);
+    if(rows.length < 100) break;
+    start += 100;
+    await sleep(80);
+    if(start > 20000) break;
   }
-  return out;
+  return all;
+}
+async function findCandidates(secid){
+  const out = [];
+  try{
+    const url = `${BASE}/securities/${encodeURIComponent(secid)}.json?iss.meta=off`;
+    const json = await getJson(url, 10000);
+    const boards = tableToObjects(json.boards).filter(b => b.is_traded === 1 || b.is_traded === '1' || b.IS_TRADED === 1);
+    for(const b of boards){
+      const board = b.boardid || b.BOARDID;
+      const market = b.market || b.MARKET || 'shares';
+      const engine = b.engine || b.ENGINE || 'stock';
+      if(engine === 'stock' && board) out.push({market, board});
+    }
+  }catch(e){}
+  for(const market of MARKETS) for(const board of BOARDS) out.push({market, board});
+  const seen = new Set();
+  return out.filter(c => { const k = `${c.market}:${c.board}`; if(seen.has(k)) return false; seen.add(k); return true; });
 }
 
-export default async function handler(req, res) {
-  const secid = String(req.query.ticker || "").trim().toUpperCase();
-  const from = String(req.query.from || "").trim();
-  const till = String(req.query.till || "").trim();
-  if (!secid || !from || !till) return send(res, 400, { error: "Нужны ticker, from, till" });
-  if (["CASH", "RUB", "MNYMKT"].includes(secid)) return send(res, 200, { ticker: secid, board: "CASH", rows: [] });
-
-  try {
-    const board = await loadBoard(secid);
-    if (!board) return send(res, 404, { ticker: secid, error: "Тикер не найден на основных board MOEX" });
-    const rows = await loadHistory(secid, board, from, till);
-    if (!rows.length) return send(res, 404, { ticker: secid, board, error: "Нет данных за выбранный диапазон" });
-    send(res, 200, { ticker: secid, board, rows });
-  } catch (e) {
-    send(res, 504, { ticker: secid, error: e?.name === "AbortError" ? "Таймаут источника" : String(e.message || e) });
+export default async function handler(req, res){
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','GET,OPTIONS');
+  if(req.method === 'OPTIONS') return res.status(200).end();
+  const q = req.query || {};
+  const tickerRaw = String(q.ticker || '').trim().toUpperCase();
+  const ticker = tickerRaw === 'YNDX' ? 'YDEX' : tickerRaw;
+  const from = String(q.from || '2024-01-01');
+  const till = String(q.till || new Date().toISOString().slice(0,10));
+  if(!ticker) return res.status(400).json({ok:false,error:'Не указан ticker'});
+  if(CASH.has(ticker)) return res.status(200).json({ok:true,ticker,board:'CASH',market:'cash',rows:[]});
+  try{
+    const candidates = await findCandidates(ticker);
+    const errors = [];
+    for(const c of candidates){
+      try{
+        const rows = await fetchHistory(ticker, c.market, c.board, from, till);
+        if(rows.length){
+          const cleaned = rows.map(r => ({
+            date: r.TRADEDATE,
+            close: Number(r.CLOSE ?? r.LEGALCLOSEPRICE ?? r.WAPRICE),
+            board: r.BOARDID || c.board
+          })).filter(r=>Number.isFinite(r.close)).sort((a,b)=>a.date.localeCompare(b.date));
+          if(cleaned.length) return res.status(200).json({ok:true,ticker,requested:tickerRaw,board:c.board,market:c.market,rows:cleaned});
+        }
+      }catch(e){ errors.push(`${c.market}/${c.board}: ${e.message}`); }
+    }
+    return res.status(200).json({ok:false,ticker,requested:tickerRaw,error:`Данные не найдены. Проверены boards: ${candidates.map(c=>c.board).slice(0,12).join(', ')}`,details:errors.slice(0,5)});
+  }catch(e){
+    return res.status(200).json({ok:false,ticker,requested:tickerRaw,error:e.message || 'Ошибка загрузки'});
   }
 }
