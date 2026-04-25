@@ -1,8 +1,103 @@
-import React,{useMemo,useState}from'react';import{createRoot}from'react-dom/client';import{Download,RefreshCw,Database}from'lucide-react';import'./style.css';
-const DEFAULT='SBER, GAZP, LKOH, GMKN, NVTK, TATN, VTBR, RUAL, MOEX, YDEX, AFLT, CASH';
-function fmt(v){return v==null||Number.isNaN(v)?'':(v*100).toFixed(2)+'%'}
-function csv(rows,tickers){const head=['Date',...tickers];const lines=[head.join(',')];for(const r of rows)lines.push([r.Date,...tickers.map(t=>fmt(r[t]))].join(','));return lines.join('\n')}
-function download(name,text){const blob=new Blob(['\ufeff'+text],{type:'text/csv;charset=utf-8;'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=name;a.click();URL.revokeObjectURL(url)}
-function stat(rows,t){const vals=rows.map(r=>r[t]).filter(v=>typeof v==='number');if(!vals.length)return null;let eq=1,max=1,mdd=0;for(const v of vals){eq*=1+v;max=Math.max(max,eq);mdd=Math.min(mdd,eq/max-1)}const avg=vals.reduce((a,b)=>a+b,0)/vals.length;const vol=Math.sqrt(vals.reduce((s,v)=>s+(v-avg)**2,0)/Math.max(vals.length-1,1))*Math.sqrt(252);return{days:vals.length,total:eq-1,vol,mdd,pos:vals.filter(v=>v>0).length/vals.length}}
-function App(){const[tickers,setTickers]=useState(DEFAULT);const[from,setFrom]=useState('2024-01-01');const[to,setTo]=useState(new Date().toISOString().slice(0,10));const[source,setSource]=useState('auto');const[loading,setLoading]=useState(false);const[data,setData]=useState(null);const[err,setErr]=useState('');const list=useMemo(()=>tickers.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean),[tickers]);async function load(){setLoading(true);setErr('');setData(null);try{const url=`/api/market-data?tickers=${encodeURIComponent(list.join(','))}&from=${from}&to=${to}&source=${source}`;const r=await fetch(url);const j=await r.json();if(!r.ok)throw new Error(j.error||'Ошибка загрузки');setData(j)}catch(e){setErr(e.message)}finally{setLoading(false)}}const rows=data?.rows||[];return <div className="wrap"><header><div><h1>Парсер российских активов: MFD / MOEX</h1><p>Дневная доходность по тикерам за выбранный период. CSV скачивается только с Daily Return.</p></div><Database size={42}/></header><section className="panel grid"><label>Тикеры<textarea value={tickers} onChange={e=>setTickers(e.target.value)}/></label><label>Дата начала<input type="date" value={from} onChange={e=>setFrom(e.target.value)}/></label><label>Дата конца<input type="date" value={to} onChange={e=>setTo(e.target.value)}/></label><label>Источник<select value={source} onChange={e=>setSource(e.target.value)}><option value="auto">Auto: MFD → MOEX</option><option value="mfd">Только MFD</option><option value="moex">Только MOEX</option></select></label><button onClick={load} disabled={loading}><RefreshCw size={18}/>{loading?'Загрузка...':'Загрузить данные'}</button>{rows.length>0&&<button className="secondary" onClick={()=>download('daily_returns_russia.csv',csv(rows,data.tickers))}><Download size={18}/>Скачать Daily Return CSV</button>}</section>{err&&<div className="error">{err}</div>}{data&&<><section className="panel"><h2>Статус загрузки</h2><div className="chips">{data.meta.map(m=><span className="chip" key={m.ticker}>{m.ticker}: {m.source}{m.board?' / '+m.board:''} · {m.points||0} дней</span>)}</div>{data.errors?.length>0&&<div className="warn">{data.errors.map(e=><div key={e}>{e}</div>)}</div>}</section><section className="panel"><h2>Статистика</h2><div className="tableBox"><table><thead><tr><th>Тикер</th><th>Дней</th><th>Итого</th><th>Волатильность год.</th><th>Макс. просадка</th><th>% положит. дней</th></tr></thead><tbody>{data.tickers.map(t=>{const s=stat(rows,t);return <tr key={t}><td>{t}</td><td>{s?.days||0}</td><td>{fmt(s?.total)}</td><td>{fmt(s?.vol)}</td><td>{fmt(s?.mdd)}</td><td>{fmt(s?.pos)}</td></tr>})}</tbody></table></div></section><section className="panel"><h2>Daily Return по дням</h2><div className="tableBox"><table><thead><tr><th>Date</th>{data.tickers.map(t=><th key={t}>{t}</th>)}</tr></thead><tbody>{rows.map((r,i)=><tr key={i}><td>{r.Date}</td>{data.tickers.map(t=><td key={t} className={(r[t]||0)>=0?'pos':'neg'}>{fmt(r[t])}</td>)}</tr>)}</tbody></table></div></section></>}</div>}
-createRoot(document.getElementById('root')).render(<App/>);
+import React, { useMemo, useRef, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import './style.css';
+
+const DEFAULT_TICKERS = 'SBER, LKOH, GAZP, TATN, GMKN, VTBR, RUAL, AFLT, NVTK, MOEX, YDEX, CASH';
+
+function parseTickers(text) {
+  return [...new Set(text.split(/[ ,;\n\t]+/).map(x => x.trim().toUpperCase()).filter(Boolean))];
+}
+function pct(x) { return x == null || !Number.isFinite(x) ? '' : (x * 100).toFixed(2) + '%'; }
+function csvEscape(v) { const s = String(v ?? ''); return /[",\n;]/.test(s) ? '"' + s.replaceAll('"','""') + '"' : s; }
+
+function App() {
+  const today = new Date().toISOString().slice(0,10);
+  const [tickersText, setTickersText] = useState(DEFAULT_TICKERS);
+  const [from, setFrom] = useState('2024-01-01');
+  const [till, setTill] = useState(today);
+  const [loading, setLoading] = useState(false);
+  const [logs, setLogs] = useState([]);
+  const [series, setSeries] = useState({});
+  const abortRef = useRef(null);
+
+  const tickers = useMemo(() => parseTickers(tickersText), [tickersText]);
+
+  async function loadTicker(ticker, signal) {
+    if (['CASH','RUB','MNYMKT'].includes(ticker)) return { ticker, rows: [], board: 'CASH' };
+    const url = `/api/moex-history?ticker=${encodeURIComponent(ticker)}&from=${from}&till=${till}`;
+    const r = await fetch(url, { signal });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+    return j;
+  }
+
+  async function loadAll() {
+    setLoading(true); setLogs([]); setSeries({});
+    const controller = new AbortController(); abortRef.current = controller;
+    const nextSeries = {};
+    for (const ticker of tickers) {
+      if (controller.signal.aborted) break;
+      setLogs(prev => [...prev, `⏳ ${ticker}: загрузка...`]);
+      try {
+        const result = await loadTicker(ticker, controller.signal);
+        nextSeries[ticker] = result.rows || [];
+        setSeries({ ...nextSeries });
+        const count = result.rows?.length || 0;
+        setLogs(prev => [...prev.filter(x => x !== `⏳ ${ticker}: загрузка...`), `✅ ${ticker}: ${count ? count + ' дней, board ' + result.board : 'кэш 0%'}`]);
+      } catch (e) {
+        setLogs(prev => [...prev.filter(x => x !== `⏳ ${ticker}: загрузка...`), `❌ ${ticker}: ${e.message}`]);
+      }
+    }
+    setLoading(false);
+  }
+  function stop() { abortRef.current?.abort(); setLoading(false); setLogs(prev => [...prev, '⛔ загрузка остановлена']); }
+
+  const returnsTable = useMemo(() => {
+    const dates = new Set();
+    const returnsByTicker = {};
+    for (const ticker of tickers) {
+      const rows = series[ticker] || [];
+      returnsByTicker[ticker] = {};
+      if (['CASH','RUB','MNYMKT'].includes(ticker)) continue;
+      for (let i = 1; i < rows.length; i++) {
+        const ret = rows[i-1].close ? rows[i].close / rows[i-1].close - 1 : null;
+        returnsByTicker[ticker][rows[i].date] = ret;
+        dates.add(rows[i].date);
+      }
+    }
+    const sorted = [...dates].sort();
+    return sorted.map(date => {
+      const row = { Date: date };
+      for (const ticker of tickers) {
+        row[ticker] = ['CASH','RUB','MNYMKT'].includes(ticker) ? 0 : (returnsByTicker[ticker]?.[date] ?? null);
+      }
+      return row;
+    });
+  }, [series, tickers]);
+
+  function downloadReturns() {
+    if (!returnsTable.length) return;
+    const header = ['Date', ...tickers];
+    const lines = [header.join(';')];
+    for (const row of returnsTable) lines.push(header.map(h => h === 'Date' ? row.Date : pct(row[h])).map(csvEscape).join(';'));
+    const blob = new Blob(['\ufeff' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = `daily_returns_moex_${from}_${till}.csv`; a.click();
+  }
+
+  return <div className="page">
+    <header><div><h1>Парсер российских активов</h1><p>Источник: серверный API MOEX ISS без CORS-зависаний. Экспорт — только Daily Return.</p></div></header>
+    <section className="card controls">
+      <label>Тикеры<textarea value={tickersText} onChange={e=>setTickersText(e.target.value)} /></label>
+      <div className="dates"><label>С даты<input type="date" value={from} onChange={e=>setFrom(e.target.value)} /></label><label>По дату<input type="date" value={till} onChange={e=>setTill(e.target.value)} /></label></div>
+      <div className="buttons"><button disabled={loading} onClick={loadAll}>{loading ? 'Загрузка...' : 'Загрузить Daily Return'}</button><button onClick={stop} disabled={!loading} className="secondary">Остановить</button><button onClick={downloadReturns} disabled={!returnsTable.length} className="secondary">Скачать CSV Daily Return</button></div>
+    </section>
+    <section className="grid">
+      <div className="card"><h2>Статус</h2><div className="log">{logs.map((l,i)=><div key={i}>{l}</div>)}</div></div>
+      <div className="card"><h2>Итог</h2><p>Тикеров: <b>{tickers.length}</b></p><p>Строк Daily Return: <b>{returnsTable.length}</b></p><p>Загружено активов: <b>{Object.keys(series).length}</b></p></div>
+    </section>
+    <section className="card"><h2>Daily Return</h2><div className="tableWrap"><table><thead><tr><th>Date</th>{tickers.map(t=><th key={t}>{t}</th>)}</tr></thead><tbody>{returnsTable.slice(-300).map(r=><tr key={r.Date}><td>{r.Date}</td>{tickers.map(t=><td key={t}>{pct(r[t])}</td>)}</tr>)}</tbody></table></div></section>
+  </div>;
+}
+
+createRoot(document.getElementById('root')).render(<App />);
